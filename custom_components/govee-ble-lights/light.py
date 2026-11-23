@@ -25,6 +25,7 @@ from homeassistant.helpers.device_registry import CONNECTION_BLUETOOTH, DeviceIn
 
 from homeassistant.exceptions import HomeAssistantError
 
+from . import protocol as p
 from .device import GoveeBLEDevice, GoveeCommandRejected
 from . import Hub
 from datetime import timedelta
@@ -94,8 +95,6 @@ class GoveeAPILight(LightEntity, dict):
                 color_modes.add(ColorMode.COLOR_TEMP)
                 self._attr_min_color_temp_kelvin = cap['parameters']['range']['min']
                 self._attr_max_color_temp_kelvin = cap['parameters']['range']['max']
-                self._attr_min_mireds = color_util.color_temperature_kelvin_to_mired(self._attr_min_color_temp_kelvin)
-                self._attr_max_mireds = color_util.color_temperature_kelvin_to_mired(self._attr_max_color_temp_kelvin)
             if cap['instance'] == 'colorRgb':
                 color_modes.add(ColorMode.RGB)
             if cap['instance'] == 'lightScene':
@@ -125,12 +124,12 @@ class GoveeAPILight(LightEntity, dict):
             if cap['instance'] == 'powerSwitch':
                 self._state = cap['state']['value'] == 1
             if cap['instance'] == 'brightness':
-                self._brightness = cap['state']['value']
+                # Govee API reports 0-100; HA uses 0-255 (cromulus/govee_ble_lights 2c3c211)
+                self._brightness = round(max(0, min(100, cap['state']['value'])) * 255 / 100)
             if cap['instance'] == 'colorTemperatureK':
                 value = cap['state']['value']
                 if value != 0:
                     self._attr_color_temp_kelvin = value
-                    self._attr_color_temp = color_util.color_temperature_kelvin_to_mired(value)
             if cap['instance'] == 'colorRgb':
                 num = cap['state']['value']
                 self._attr_rgb_color = ((num >> 16) & 0xFF, (num >> 8) & 0xFF, num & 0xFF)
@@ -168,7 +167,7 @@ class GoveeAPILight(LightEntity, dict):
 
         if ATTR_BRIGHTNESS in kwargs:
             brightness = kwargs.get(ATTR_BRIGHTNESS, 255)
-            await self.hub.api.set_brightness(self.sku, self.device, (brightness / 255) * 100)
+            await self.hub.api.set_brightness(self.sku, self.device, round(brightness * 100 / 255))
             self._brightness = brightness
 
         if ATTR_RGB_COLOR in kwargs:
@@ -239,8 +238,7 @@ class GoveeBluetoothLight(LightEntity):
         self._attr_effect_list = list(self._scenes)
         if device.segmented:
             self._attr_supported_color_modes = {ColorMode.RGB, ColorMode.COLOR_TEMP}
-            self._attr_min_color_temp_kelvin = 2000
-            self._attr_max_color_temp_kelvin = 9000
+            self._attr_min_color_temp_kelvin, self._attr_max_color_temp_kelvin = p.ct_range(device.model)
         else:
             self._attr_supported_color_modes = {ColorMode.RGB}
         self._attr_device_info = DeviceInfo(
@@ -328,7 +326,7 @@ class GoveeBluetoothLight(LightEntity):
         if ATTR_COLOR_TEMP_KELVIN in kwargs:
             kelvin = kwargs[ATTR_COLOR_TEMP_KELVIN]
             white = tuple(int(c) for c in color_util.color_temperature_to_rgb(kelvin))
-            await self._device.async_set_color_temp(kelvin, white)
+            await self._device.async_set_color_temp(kelvin, p.ct_tint(self._device.model, kelvin) or white)
         if ATTR_BRIGHTNESS in kwargs:
             await self._device.async_set_brightness(kwargs[ATTR_BRIGHTNESS])
 
@@ -340,7 +338,8 @@ class GoveeBluetoothLight(LightEntity):
         if rgb_color is not None:
             await self._device.async_set_rgb(tuple(rgb_color), segments)
         if color_temp_kelvin is not None:
-            white = tuple(int(c) for c in color_util.color_temperature_to_rgb(color_temp_kelvin))
+            white = p.ct_tint(self._device.model, color_temp_kelvin) or tuple(
+                int(c) for c in color_util.color_temperature_to_rgb(color_temp_kelvin))
             await self._device.async_set_color_temp(color_temp_kelvin, white, segments)
         if brightness_pct is not None:
             await self._device.async_set_segment_brightness(brightness_pct, segments)

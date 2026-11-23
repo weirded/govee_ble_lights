@@ -54,3 +54,9 @@ assert s3.uniform_rgb() == (0, 255, 0) and s3.kelvin is None
 assert p.rgb_manual(0, 255, 0, p.MANUAL_COLOR_MODES["H7013"])[:6].hex() == "33050d00ff00"
 assert p.status_queries("H7013") == [p.query(1), p.query(4), p.query(5)]
 print("ok; H7013")
+# H6072 CT range + app-captured tints (cromulus 5e74328)
+assert p.ct_range("H6072") == (2200, 6500) and p.ct_range("H7013") == (2000, 9000)
+assert p.ct_tint("H6072", 2200) == (0xff, 0x98, 0x29) and p.ct_tint("H6072", 6500) == (0xff, 0xf9, 0xfb)
+assert p.ct_tint("H6072", 2749) == p.ct_tint("H6072", 2700) and p.ct_tint("H6072", 1500) == p.ct_tint("H6072", 2200)
+assert p.ct_tint("H7013", 3000) is None
+print("ok; CT tints")

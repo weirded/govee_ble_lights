@@ -1,4 +1,5 @@
 import requests
+from homeassistant.exceptions import HomeAssistantError
 import asyncio
 
 import uuid
@@ -31,7 +32,7 @@ class GoveeAPI:
 
     async def toggle_power(self, sku: str, device: str, value: int):
         url = f"{self.base_url}/device/control"
-        response = await asyncio.to_thread(requests.post, url, headers=self.headers, json={
+        response = await asyncio.to_thread(requests.post, url, headers=self.headers, timeout=10, json={
             'requestId': uuid.uuid4().hex,
             'payload': {
                 'sku': sku,
@@ -43,7 +44,12 @@ class GoveeAPI:
                 }
             }
         })
-        return response.json()
+        # cromulus/govee_ble_lights 435ca98: surface rejected power commands
+        response.raise_for_status()
+        result = response.json()
+        if result.get('code') != 200:
+            raise HomeAssistantError(f"Govee rejected the power command (code {result.get('code')})")
+        return result
 
     async def get_device_state(self, sku: str, device: str):
         url = f"{self.base_url}/device/state"

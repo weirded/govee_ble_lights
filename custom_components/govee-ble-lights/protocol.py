@@ -66,6 +66,30 @@ SEGMENT_COUNTS = {"H6072": 8}
 MIN_KELVIN = 2000
 MAX_KELVIN = 9000
 
+# Per-model colour-temperature range and white-point tints. The H6072 values
+# come from Govee-app captures (cromulus/govee_ble_lights 5e74328): the app
+# offers 2200-6500 K in 100 K steps and sends 2-degree blackbody RGB with it.
+CT_RANGES = {"H6072": (2200, 6500)}
+_H6072_TINTS = tuple(bytes.fromhex(v) for v in (
+    "ff9829 ff9d33 ffa23c ffa645 ffaa4d ffae54 ffb25b ffb662 ffb969 ffbd6f "
+    "ffc076 ffc37c ffc682 ffc987 ffcb8d ffce92 ffd097 ffd39c ffd5a1 ffd7a6 "
+    "ffd9ab ffdbaf ffddb4 ffdfb8 ffe1bc ffe2c0 ffe4c4 ffe5c8 ffe7cc ffe8d0 "
+    "ffead3 ffebd7 ffedda ffeede ffefe1 fff0e4 fff1e7 fff3ea fff4ed fff5f0 "
+    "fff6f3 fff7f5 fff8f8 fff9fb").split())
+
+
+def ct_range(model: str) -> tuple[int, int]:
+    return CT_RANGES.get(model, (MIN_KELVIN, MAX_KELVIN))
+
+
+def ct_tint(model: str, kelvin: int) -> tuple[int, int, int] | None:
+    """App-captured white point for ``kelvin`` (nearest 100 K), if known."""
+    if model != "H6072":
+        return None
+    lo, hi = CT_RANGES["H6072"]
+    idx = (max(lo, min(hi, int(kelvin))) - lo + 50) // 100
+    return tuple(_H6072_TINTS[min(idx, len(_H6072_TINTS) - 1)])
+
 
 def checksum(data: bytes | list[int]) -> int:
     c = 0
