@@ -15,6 +15,11 @@ firmware 1.03.05, advertising as ``ihoment_H6072_*``) on 2026-11-23:
     AA 06 -> aa 06 "1.03.05"           firmware version (ASCII)
     AA A5 NN -> aa a5 NN [b r g b]x3   segment brightness + RGB, 3 per frame
     AA 13 -> no reply (unsupported on H6072)
+
+Every 0x33 command is acknowledged on notify with ``33 <cmd> <status>``:
+status 00 = accepted, 01 = rejected (e.g. ``33 05 02`` manual RGB on H6072).
+In colour-temperature mode ``AA 05`` replies ``aa 05 15 00 <K_hi> <K_lo>``
+and the segment colours read back as 000000.
 """
 
 from __future__ import annotations
@@ -188,6 +193,14 @@ class LightState:
     segments: dict[int, Segment] = field(default_factory=dict)  # 1-based
 
     @property
+    def kelvin(self) -> int | None:
+        """Colour temperature when the light is in white (CT) mode."""
+        if self.mode == MODE_SEGMENTED and len(self.mode_data) >= 3:
+            k = (self.mode_data[1] << 8) | self.mode_data[2]
+            return k or None
+        return None
+
+    @property
     def scene_code(self) -> int | None:
         if self.mode == MODE_SCENE and len(self.mode_data) >= 2:
             return self.mode_data[0] | (self.mode_data[1] << 8)
@@ -197,6 +210,13 @@ class LightState:
         """RGB shared by all lit segments, or None if they differ."""
         colours = {s.rgb for s in self.segments.values() if s.brightness > 0}
         return colours.pop() if len(colours) == 1 else None
+
+
+def parse_ack(frame: bytes) -> tuple[int, bool] | None:
+    """``33 <cmd> <status>`` ack -> (cmd, accepted), else None."""
+    if not valid_frame(frame) or frame[0] != HEAD_COMMAND:
+        return None
+    return frame[1], frame[2] == 0x00
 
 
 def apply_status_frame(state: LightState, frame: bytes) -> int | None:

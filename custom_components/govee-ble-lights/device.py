@@ -33,6 +33,10 @@ REPLY_TIMEOUT = 1.5
 INTER_FRAME_DELAY = 0.05
 
 
+class GoveeCommandRejected(Exception):
+    """The light acknowledged a command with a non-zero status."""
+
+
 class GoveeBLEDevice:
     def __init__(self, ble_device: BLEDevice, model: str, name: str) -> None:
         self._ble_device = ble_device
@@ -43,6 +47,7 @@ class GoveeBLEDevice:
         self._lock = asyncio.Lock()
         self._disconnect_timer: asyncio.TimerHandle | None = None
         self._pending: dict[int, asyncio.Future[None]] = {}
+        self._pending_acks: dict[int, asyncio.Future[bool]] = {}
         self._listeners: list[Callable[[], None]] = []
 
     # ------------------------------------------------------------ plumbing
@@ -64,6 +69,12 @@ class GoveeBLEDevice:
 
     def _on_notify(self, _char, data: bytearray) -> None:
         frame = bytes(data)
+        ack = p.parse_ack(frame)
+        if ack is not None:
+            fut = self._pending_acks.pop(ack[0], None)
+            if fut and not fut.done():
+                fut.set_result(ack[1])
+            return
         cmd = p.apply_status_frame(self.state, frame)
         if cmd is None:
             _LOGGER.debug("%s: ignoring notify %s", self.name, frame.hex())
@@ -81,6 +92,10 @@ class GoveeBLEDevice:
             if not fut.done():
                 fut.cancel()
         self._pending.clear()
+        for fut in self._pending_acks.values():
+            if not fut.done():
+                fut.cancel()
+        self._pending_acks.clear()
 
     async def _ensure_connected(self) -> BleakClientWithServiceCache:
         if self._client and self._client.is_connected:
@@ -124,10 +139,24 @@ class GoveeBLEDevice:
         async with self._lock:
             try:
                 client = await self._ensure_connected()
+                loop = asyncio.get_running_loop()
                 for frame in frames:
                     _LOGGER.debug("%s: write %s", self.name, frame.hex())
+                    if frame[0] != p.HEAD_COMMAND:
+                        await client.write_gatt_char(WRITE_UUID, frame, response=False)
+                        await asyncio.sleep(INTER_FRAME_DELAY)
+                        continue
+                    fut = loop.create_future()
+                    self._pending_acks[frame[1]] = fut
                     await client.write_gatt_char(WRITE_UUID, frame, response=False)
-                    await asyncio.sleep(INTER_FRAME_DELAY)
+                    try:
+                        accepted = await asyncio.wait_for(fut, REPLY_TIMEOUT)
+                    except (TimeoutError, asyncio.CancelledError):
+                        self._pending_acks.pop(frame[1], None)
+                        _LOGGER.debug("%s: no ack for %s", self.name, frame.hex())
+                        continue
+                    if not accepted:
+                        raise GoveeCommandRejected(f"{self.name} rejected command {frame.hex()}")
             finally:
                 self._schedule_disconnect()
 
@@ -202,6 +231,7 @@ class GoveeBLEDevice:
             frame = p.rgb_manual(*rgb)
         await self._write([frame])
         self.state.mode = p.MODE_SEGMENTED if self.segmented else p.MODE_MANUAL
+        self.state.mode_data = b""
         for seg in segments or list(self.state.segments):
             if seg in self.state.segments:
                 self.state.segments[seg].rgb = tuple(rgb)
@@ -215,6 +245,7 @@ class GoveeBLEDevice:
         mask = p.segment_mask(segments) if segments else p.all_segments_mask(self.model)
         await self._write([p.color_temp_segments(kelvin, white, mask)])
         self.state.mode = p.MODE_SEGMENTED
+        self.state.mode_data = bytes([0, (kelvin >> 8) & 0xFF, kelvin & 0xFF])
         self._notify_listeners()
 
     async def async_set_segment_brightness(self, pct: int, segments: list[int]) -> None:

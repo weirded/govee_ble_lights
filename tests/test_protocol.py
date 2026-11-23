@@ -30,3 +30,17 @@ for cat in json.load(open(f"{D}/jsons/H6072.json"))['data']['categories']:
             assert a == p.multi_packet(0xa3, [2], d), len(d); n += 1
 print("ok; multi_packet matches upstream on", n, "scene payloads")
 print("CT 2700K:", p.color_temp_segments(2700, (255, 166, 87), 0xFF).hex())
+# live-captured on 2026-11-23: CT mode readback and command acks
+s2 = p.LightState()
+p.apply_status_frame(s2, bytes.fromhex("aa0515000a8c000000000000000000000000003c"))
+assert s2.mode == 0x15 and s2.kelvin == 2700
+p.apply_status_frame(s2, bytes.fromhex("aa051500196400000000000000000000000000c7"))
+assert s2.kelvin == 6500
+p.apply_status_frame(s2, bytes.fromhex("aa051500000000000000000000000000000000ba"))
+assert s2.kelvin is None
+p.apply_status_frame(s2, bytes.fromhex("aa0504200000000000000000000000000000008b"))
+assert s2.scene_code == 32 and s2.kelvin is None
+assert p.parse_ack(bytes.fromhex("3305000000000000000000000000000000000036")) == (5, True)
+assert p.parse_ack(bytes.fromhex("3305010000000000000000000000000000000037")) == (5, False)
+assert p.color_temp_segments(2700, (255, 166, 87), 0xFF)[7:9] == bytes.fromhex("0a8c")
+print("ok; CT readback + acks")

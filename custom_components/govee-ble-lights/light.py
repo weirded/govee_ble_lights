@@ -23,7 +23,9 @@ from bleak.exc import BleakError
 from homeassistant.helpers import config_validation as cv, entity_platform
 from homeassistant.helpers.device_registry import CONNECTION_BLUETOOTH, DeviceInfo
 
-from .device import GoveeBLEDevice
+from homeassistant.exceptions import HomeAssistantError
+
+from .device import GoveeBLEDevice, GoveeCommandRejected
 from . import Hub
 from datetime import timedelta
 
@@ -240,7 +242,6 @@ class GoveeBluetoothLight(LightEntity):
             self._attr_max_color_temp_kelvin = 9000
         else:
             self._attr_supported_color_modes = {ColorMode.RGB}
-        self._attr_color_mode = ColorMode.RGB
         self._attr_device_info = DeviceInfo(
             connections={(CONNECTION_BLUETOOTH, self._mac)},
             name=config_entry.title,
@@ -273,7 +274,19 @@ class GoveeBluetoothLight(LightEntity):
         return self._device.ha_brightness()
 
     @property
+    def color_mode(self) -> ColorMode:
+        if ColorMode.COLOR_TEMP in self._attr_supported_color_modes and self._device.state.kelvin:
+            return ColorMode.COLOR_TEMP
+        return ColorMode.RGB
+
+    @property
+    def color_temp_kelvin(self) -> int | None:
+        return self._device.state.kelvin
+
+    @property
     def rgb_color(self):
+        if self._device.state.kelvin:
+            return None
         return self._device.state.uniform_rgb()
 
     @property
@@ -288,6 +301,7 @@ class GoveeBluetoothLight(LightEntity):
             "firmware": state.firmware,
             "mode": f"0x{state.mode:02x}" if state.mode is not None else None,
             "scene_code": state.scene_code,
+            "color_temp_kelvin": state.kelvin,
             "segments": {
                 seg: {"brightness": s.brightness, "rgb": list(s.rgb)}
                 for seg, s in sorted(state.segments.items())
@@ -295,6 +309,12 @@ class GoveeBluetoothLight(LightEntity):
         }
 
     async def async_turn_on(self, **kwargs) -> None:
+        try:
+            await self._async_turn_on(**kwargs)
+        except GoveeCommandRejected as err:
+            raise HomeAssistantError(str(err)) from err
+
+    async def _async_turn_on(self, **kwargs) -> None:
         if not self._device.state.power:
             await self._device.async_set_power(True)
         if ATTR_EFFECT in kwargs:
@@ -304,13 +324,10 @@ class GoveeBluetoothLight(LightEntity):
             await self._device.async_set_scene(*self._scenes[name])
         if ATTR_RGB_COLOR in kwargs:
             await self._device.async_set_rgb(tuple(kwargs[ATTR_RGB_COLOR]))
-            self._attr_color_mode = ColorMode.RGB
         if ATTR_COLOR_TEMP_KELVIN in kwargs:
             kelvin = kwargs[ATTR_COLOR_TEMP_KELVIN]
             white = tuple(int(c) for c in color_util.color_temperature_to_rgb(kelvin))
             await self._device.async_set_color_temp(kelvin, white)
-            self._attr_color_mode = ColorMode.COLOR_TEMP
-            self._attr_color_temp_kelvin = kelvin
         if ATTR_BRIGHTNESS in kwargs:
             await self._device.async_set_brightness(kwargs[ATTR_BRIGHTNESS])
 
