@@ -44,3 +44,13 @@ assert p.parse_ack(bytes.fromhex("3305000000000000000000000000000000000036")) ==
 assert p.parse_ack(bytes.fromhex("3305010000000000000000000000000000000037")) == (5, False)
 assert p.color_temp_segments(2700, (255, 166, 87), 0xFF)[7:9] == bytes.fromhex("0a8c")
 print("ok; CT readback + acks")
+# H7013 (fw 1.00.23), captured 2026-11-23
+s3 = p.LightState()
+for c in ["aa0100", "aa042a", "aa05042c00ff"]:
+    p.apply_status_frame(s3, p.build_frame(bytes.fromhex(c)))
+assert (s3.power, s3.brightness_raw, s3.scene_code) == (False, 42, 44)
+p.apply_status_frame(s3, p.build_frame(bytes.fromhex("aa050d00ff00")))
+assert s3.uniform_rgb() == (0, 255, 0) and s3.kelvin is None
+assert p.rgb_manual(0, 255, 0, p.MANUAL_COLOR_MODES["H7013"])[:6].hex() == "33050d00ff00"
+assert p.status_queries("H7013") == [p.query(1), p.query(4), p.query(5)]
+print("ok; H7013")

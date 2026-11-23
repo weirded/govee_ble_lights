@@ -228,10 +228,13 @@ class GoveeBLEDevice:
         else:
             if segments:
                 raise ValueError(f"{self.model} has no segment control")
-            frame = p.rgb_manual(*rgb)
+            sub_mode = p.MANUAL_COLOR_MODES.get(self.model, p.MODE_MANUAL)
+            frame = p.rgb_manual(*rgb, sub_mode=sub_mode)
         await self._write([frame])
-        self.state.mode = p.MODE_SEGMENTED if self.segmented else p.MODE_MANUAL
-        self.state.mode_data = b""
+        if self.segmented:
+            self.state.mode, self.state.mode_data = p.MODE_SEGMENTED, b""
+        else:
+            self.state.mode, self.state.mode_data = sub_mode, bytes(rgb)
         for seg in segments or list(self.state.segments):
             if seg in self.state.segments:
                 self.state.segments[seg].rgb = tuple(rgb)

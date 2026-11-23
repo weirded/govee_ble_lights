@@ -41,6 +41,7 @@ CMD_SEGMENTS = 0xA5
 # Sub-modes of CMD_MODE (byte 2)
 MODE_MANUAL = 0x02
 MODE_SCENE = 0x04
+MODE_MANUAL_ALT = 0x0D
 MODE_SEGMENTED = 0x15
 
 # Ops inside MODE_SEGMENTED (byte 3)
@@ -53,7 +54,11 @@ SEGMENTS_PER_STATUS_FRAME = 3
 SEGMENTED_MODELS = frozenset({"H6053", "H6072", "H6102", "H6199"})
 
 # Models whose brightness byte is 0-100 rather than 0-255 (verified via AA 04).
-PERCENT_BRIGHTNESS_MODELS = frozenset({"H6072"})
+PERCENT_BRIGHTNESS_MODELS = frozenset({"H6072", "H7013"})
+
+# Colour sub-mode for non-segmented models. H7013 (fw 1.00.23) acks 33 05 02
+# but drops the RGB; 33 05 0D stores it and reads back as aa 05 0d RR GG BB.
+MANUAL_COLOR_MODES = {"H7013": MODE_MANUAL_ALT}
 
 # Segment counts for models where it is known; used for the all-segments mask.
 SEGMENT_COUNTS = {"H6072": 8}
@@ -108,8 +113,8 @@ def segment_mask(segments: list[int]) -> int:
     return mask
 
 
-def rgb_manual(r: int, g: int, b: int) -> bytes:
-    return build_frame([HEAD_COMMAND, CMD_MODE, MODE_MANUAL, r, g, b])
+def rgb_manual(r: int, g: int, b: int, sub_mode: int = MODE_MANUAL) -> bytes:
+    return build_frame([HEAD_COMMAND, CMD_MODE, sub_mode, r, g, b])
 
 
 def rgb_segments(r: int, g: int, b: int, mask: int) -> bytes:
@@ -207,7 +212,15 @@ class LightState:
         return None
 
     def uniform_rgb(self) -> tuple[int, int, int] | None:
-        """RGB shared by all lit segments, or None if they differ."""
+        """RGB shared by all lit segments, or None if they differ.
+
+        Non-segmented lights report their colour in ``AA 05 <02|0D> R G B``.
+        """
+        if not self.segments:
+            if self.mode in (MODE_MANUAL, MODE_MANUAL_ALT) and len(self.mode_data) >= 3:
+                rgb = tuple(self.mode_data[:3])
+                return rgb if any(rgb) else None
+            return None
         colours = {s.rgb for s in self.segments.values() if s.brightness > 0}
         return colours.pop() if len(colours) == 1 else None
 
