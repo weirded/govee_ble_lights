@@ -1,13 +1,8 @@
 from __future__ import annotations
 
-import array
 import logging
-import re
 
-from enum import IntEnum
-import bleak_retry_connector
 
-from bleak import BleakClient
 from homeassistant.components import bluetooth
 from homeassistant.components.light import (ATTR_BRIGHTNESS, ATTR_RGB_COLOR, ATTR_EFFECT, ColorMode, LightEntity,
                                             LightEntityFeature, ATTR_COLOR_TEMP_KELVIN)
@@ -20,8 +15,15 @@ import homeassistant.util.color as color_util
 from .const import DOMAIN
 from pathlib import Path
 import json
-from .govee_utils import prepareMultiplePacketsData
+import asyncio
 import base64
+
+import voluptuous as vol
+from bleak.exc import BleakError
+from homeassistant.helpers import config_validation as cv, entity_platform
+from homeassistant.helpers.device_registry import CONNECTION_BLUETOOTH, DeviceInfo
+
+from .device import GoveeBLEDevice
 from . import Hub
 from datetime import timedelta
 
@@ -30,27 +32,7 @@ SCAN_INTERVAL = timedelta(seconds=30)
 
 _LOGGER = logging.getLogger(__name__)
 
-UUID_CONTROL_CHARACTERISTIC = '00010203-0405-0607-0809-0a0b0c0d2b11'
-EFFECT_PARSE = re.compile("\[(\d+)/(\d+)/(\d+)/(\d+)]")
-SEGMENTED_MODELS = ['H6053', 'H6072', 'H6102', 'H6199']
 
-class LedCommand(IntEnum):
-    """ A control command packet's type. """
-    POWER = 0x01
-    BRIGHTNESS = 0x04
-    COLOR = 0x05
-
-
-class LedMode(IntEnum):
-    """
-    The mode in which a color change happens in.
-    
-    Currently only manual is supported.
-    """
-    MANUAL = 0x02
-    MICROPHONE = 0x06
-    SCENES = 0x05
-    SEGMENTS = 0x15
 
 
 async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, async_add_entities):
@@ -66,8 +48,18 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
                 _LOGGER.info("Adding device: %s", device)
                 async_add_entities([GoveeAPILight(hub, device)])
     elif hub.address is not None:
-        ble_device = bluetooth.async_ble_device_from_address(hass, hub.address.upper(), False)
-        async_add_entities([GoveeBluetoothLight(hub, ble_device, config_entry)])
+        async_add_entities([GoveeBluetoothLight(hub, hub.ble, config_entry)], update_before_add=False)
+        platform = entity_platform.async_get_current_platform()
+        platform.async_register_entity_service(
+            "set_segments",
+            {
+                vol.Required("segments"): vol.All(cv.ensure_list, [vol.All(vol.Coerce(int), vol.Range(min=1, max=16))]),
+                vol.Exclusive("rgb_color", "colour"): vol.All(vol.ExactSequence((cv.byte, cv.byte, cv.byte)), vol.Coerce(tuple)),
+                vol.Exclusive("color_temp_kelvin", "colour"): vol.All(vol.Coerce(int), vol.Range(min=2000, max=9000)),
+                vol.Optional("brightness_pct"): vol.All(vol.Coerce(int), vol.Range(min=0, max=100)),
+            },
+            "async_set_segments",
+        )
 
 
 class GoveeAPILight(LightEntity, dict):
@@ -202,140 +194,135 @@ class GoveeAPILight(LightEntity, dict):
         self._state = False
 
 
+def _load_scenes(model: str) -> dict[str, tuple[int, bytes]]:
+    """Scene name -> (sceneCode, scenceParam bytes) from the bundled Govee library.
+
+    The scene payload lives in ``lightEffects[].scenceParam`` (``specialEffect``
+    is empty for H6072 and many other models).
+    """
+    path = Path(__file__).parent / "jsons" / f"{model}.json"
+    if not path.exists():
+        return {}
+    scenes: dict[str, tuple[int, bytes]] = {}
+    data = json.loads(path.read_text())
+    for category in data["data"]["categories"]:
+        for scene in category["scenes"]:
+            effects = scene["lightEffects"]
+            for effect in effects:
+                code = effect.get("sceneCode") or scene.get("sceneCode")
+                if not code:
+                    continue
+                name = f"{category['categoryName']} - {scene['sceneName']}"
+                if len(effects) > 1 and effect.get("scenceName"):
+                    name += f" - {effect['scenceName']}"
+                param = base64.b64decode(effect.get("scenceParam") or "")
+                scenes.setdefault(name, (int(code), param))
+    return scenes
+
+
 class GoveeBluetoothLight(LightEntity):
-    _attr_color_mode = ColorMode.RGB
-    _attr_supported_color_modes = {ColorMode.RGB}
-    _attr_supported_features = LightEntityFeature(
-        LightEntityFeature.EFFECT | LightEntityFeature.FLASH | LightEntityFeature.TRANSITION)
+    _attr_has_entity_name = True
+    _attr_name = None
+    _attr_should_poll = True
+    _attr_supported_features = LightEntityFeature.EFFECT
 
-    def __init__(self, hub: Hub, ble_device, config_entry: ConfigEntry) -> None:
-        """Initialize an bluetooth light."""
+    def __init__(self, hub: Hub, device: GoveeBLEDevice, config_entry: ConfigEntry) -> None:
+        self.hub = hub
+        self._device = device
         self._mac = hub.address
-        self._model = config_entry.data["model"]
-        self._is_segmented = self._model in SEGMENTED_MODELS
-        self._ble_device = ble_device
-        self._state = None
-        self._brightness = None
+        self._attr_unique_id = self._mac.replace(":", "")
+        self._scenes = _load_scenes(device.model)
+        self._scene_by_code = {code: name for name, (code, _) in self._scenes.items()}
+        self._attr_effect_list = list(self._scenes)
+        if device.segmented:
+            self._attr_supported_color_modes = {ColorMode.RGB, ColorMode.COLOR_TEMP}
+            self._attr_min_color_temp_kelvin = 2000
+            self._attr_max_color_temp_kelvin = 9000
+        else:
+            self._attr_supported_color_modes = {ColorMode.RGB}
+        self._attr_color_mode = ColorMode.RGB
+        self._attr_device_info = DeviceInfo(
+            connections={(CONNECTION_BLUETOOTH, self._mac)},
+            name=config_entry.title,
+            manufacturer="Govee",
+            model=device.model,
+        )
 
-    @property
-    def effect_list(self) -> list[str] | None:
-        effect_list = []
-        json_data = json.loads(Path(Path(__file__).parent / "jsons" / (self._model + ".json")).read_text())
-        for categoryIdx, category in enumerate(json_data['data']['categories']):
-            for sceneIdx, scene in enumerate(category['scenes']):
-                for leffectIdx, lightEffect in enumerate(scene['lightEffects']):
-                    for seffectIxd, specialEffect in enumerate(lightEffect['specialEffect']):
-                        # if 'supportSku' not in specialEffect or self._model in specialEffect['supportSku']:
-                        # Workaround cause we need to store some metadata in effect (effect names not unique)
-                        indexes = str(categoryIdx) + "/" + str(sceneIdx) + "/" + str(leffectIdx) + "/" + str(
-                            seffectIxd)
-                        effect_list.append(
-                            category['categoryName'] + " - " + scene['sceneName'] + ' - ' + lightEffect[
-                                'scenceName'] + " [" + indexes + "]")
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(self._device.add_listener(self.async_write_ha_state))
 
-        return effect_list
+    async def async_will_remove_from_hass(self) -> None:
+        await self._device.async_stop()
 
-    @property
-    def name(self) -> str:
-        """Return the name of the switch."""
-        return "GOVEE Light"
-
-    @property
-    def unique_id(self) -> str:
-        """Return a unique, Home Assistant friendly identifier for this entity."""
-        return self._mac.replace(":", "")
-
-    @property
-    def brightness(self):
-        return self._brightness
+    async def async_update(self) -> None:
+        try:
+            await self._device.async_update()
+        except (BleakError, TimeoutError, asyncio.TimeoutError) as err:
+            if self._attr_available:
+                _LOGGER.warning("%s: status poll failed: %s", self._device.name, err)
+            self._attr_available = False
+            return
+        self._attr_available = True
 
     @property
     def is_on(self) -> bool | None:
-        """Return true if light is on."""
-        return self._state
+        return self._device.state.power
+
+    @property
+    def brightness(self) -> int | None:
+        return self._device.ha_brightness()
+
+    @property
+    def rgb_color(self):
+        return self._device.state.uniform_rgb()
+
+    @property
+    def effect(self) -> str | None:
+        code = self._device.state.scene_code
+        return self._scene_by_code.get(code) if code is not None else None
+
+    @property
+    def extra_state_attributes(self):
+        state = self._device.state
+        return {
+            "firmware": state.firmware,
+            "mode": f"0x{state.mode:02x}" if state.mode is not None else None,
+            "scene_code": state.scene_code,
+            "segments": {
+                seg: {"brightness": s.brightness, "rgb": list(s.rgb)}
+                for seg, s in sorted(state.segments.items())
+            },
+        }
 
     async def async_turn_on(self, **kwargs) -> None:
-        commands = [self._prepareSinglePacketData(LedCommand.POWER, [0x1])]
-
-        self._state = True
-
-        if ATTR_BRIGHTNESS in kwargs:
-            brightness = kwargs.get(ATTR_BRIGHTNESS, 255)
-            commands.append(self._prepareSinglePacketData(LedCommand.BRIGHTNESS, [brightness]))
-            self._brightness = brightness
-
-        if ATTR_RGB_COLOR in kwargs:
-            red, green, blue = kwargs.get(ATTR_RGB_COLOR)
-
-            if self._is_segmented:
-                commands.append(self._prepareSinglePacketData(LedCommand.COLOR,
-                                                              [LedMode.SEGMENTS, 0x01, red, green, blue, 0x00, 0x00, 0x00,
-                                                               0x00, 0x00, 0xFF, 0x7F]))
-            else:
-                commands.append(self._prepareSinglePacketData(LedCommand.COLOR, [LedMode.MANUAL, red, green, blue]))
+        if not self._device.state.power:
+            await self._device.async_set_power(True)
         if ATTR_EFFECT in kwargs:
-            effect = kwargs.get(ATTR_EFFECT)
-            if len(effect) > 0:
-                search = EFFECT_PARSE.search(effect)
-
-                # Parse effect indexes
-                categoryIndex = int(search.group(1))
-                sceneIndex = int(search.group(2))
-                lightEffectIndex = int(search.group(3))
-                specialEffectIndex = int(search.group(4))
-
-                json_data = json.loads(Path(Path(__file__).parent / "jsons" / (self._model + ".json")).read_text())
-                category = json_data['data']['categories'][categoryIndex]
-                scene = category['scenes'][sceneIndex]
-                lightEffect = scene['lightEffects'][lightEffectIndex]
-                specialEffect = lightEffect['specialEffect'][specialEffectIndex]
-
-                # Prepare packets to send big payload in separated chunks
-                for command in prepareMultiplePacketsData(0xa3,
-                                                          array.array('B', [0x02]),
-                                                          array.array('B',
-                                                                      base64.b64decode(specialEffect['scenceParam'])
-                                                                      )):
-                    commands.append(command)
-
-        for command in commands:
-            client = await self._connectBluetooth()
-            await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC, command, False)
+            name = kwargs[ATTR_EFFECT]
+            if name not in self._scenes:
+                raise ValueError(f"unknown scene: {name}")
+            await self._device.async_set_scene(*self._scenes[name])
+        if ATTR_RGB_COLOR in kwargs:
+            await self._device.async_set_rgb(tuple(kwargs[ATTR_RGB_COLOR]))
+            self._attr_color_mode = ColorMode.RGB
+        if ATTR_COLOR_TEMP_KELVIN in kwargs:
+            kelvin = kwargs[ATTR_COLOR_TEMP_KELVIN]
+            white = tuple(int(c) for c in color_util.color_temperature_to_rgb(kelvin))
+            await self._device.async_set_color_temp(kelvin, white)
+            self._attr_color_mode = ColorMode.COLOR_TEMP
+            self._attr_color_temp_kelvin = kelvin
+        if ATTR_BRIGHTNESS in kwargs:
+            await self._device.async_set_brightness(kwargs[ATTR_BRIGHTNESS])
 
     async def async_turn_off(self, **kwargs) -> None:
-        client = await self._connectBluetooth()
-        await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC,
-                                     self._prepareSinglePacketData(LedCommand.POWER, [0x0]), False)
-        self._state = False
+        await self._device.async_set_power(False)
 
-    async def _connectBluetooth(self) -> BleakClient:
-        for i in range(3):
-            try:
-                client = await bleak_retry_connector.establish_connection(BleakClient, self._ble_device, self.unique_id)
-                return client
-            except:
-                continue
-
-    def _prepareSinglePacketData(self, cmd, payload):
-        if not isinstance(cmd, int):
-            raise ValueError('Invalid command')
-        if not isinstance(payload, bytes) and not (
-                isinstance(payload, list) and all(isinstance(x, int) for x in payload)):
-            raise ValueError('Invalid payload')
-        if len(payload) > 17:
-            raise ValueError('Payload too long')
-
-        cmd = cmd & 0xFF
-        payload = bytes(payload)
-
-        frame = bytes([0x33, cmd]) + bytes(payload)
-        # pad frame data to 19 bytes (plus checksum)
-        frame += bytes([0] * (19 - len(frame)))
-
-        # The checksum is calculated by XORing all data bytes
-        checksum = 0
-        for b in frame:
-            checksum ^= b
-
-        frame += bytes([checksum & 0xFF])
-        return frame
+    async def async_set_segments(self, segments, rgb_color=None, color_temp_kelvin=None, brightness_pct=None):
+        segments = [int(s) for s in segments]
+        if rgb_color is not None:
+            await self._device.async_set_rgb(tuple(rgb_color), segments)
+        if color_temp_kelvin is not None:
+            white = tuple(int(c) for c in color_util.color_temperature_to_rgb(color_temp_kelvin))
+            await self._device.async_set_color_temp(color_temp_kelvin, white, segments)
+        if brightness_pct is not None:
+            await self._device.async_set_segment_brightness(brightness_pct, segments)

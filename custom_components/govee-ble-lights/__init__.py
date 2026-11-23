@@ -4,12 +4,13 @@ import asyncio
 
 from homeassistant.components import bluetooth
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.const import (CONF_API_KEY, CONF_MODEL, MAJOR_VERSION, MINOR_VERSION)
 from homeassistant.helpers.storage import Store
 
 from .govee_api import GoveeAPI
+from .device import GoveeBLEDevice
 
 from .const import DOMAIN
 import logging
@@ -20,11 +21,12 @@ PLATFORMS: list[str] = ["light"]
 
 
 class Hub:
-    def __init__(self, api: GoveeAPI | None, address: str = None, devices: list = None) -> None:
+    def __init__(self, api: GoveeAPI | None, address: str = None, devices: list = None, ble=None) -> None:
         """Init Govee dummy hub."""
         self.api = api
         self.devices = devices
         self.address = address
+        self.ble = ble
 
 
 async def async_setup_api(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
@@ -81,7 +83,23 @@ async def async_setup_ble(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             f"Could not find Govee BLE device with address {address}"
         )
 
-    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = Hub(None, address=address)
+    ble = GoveeBLEDevice(ble_device, entry.data[CONF_MODEL], entry.title)
+
+    @callback
+    def _async_update_ble(service_info: bluetooth.BluetoothServiceInfoBleak, change) -> None:
+        # Keep the BLEDevice current so connections go through the best proxy.
+        ble.set_ble_device(service_info.device)
+
+    entry.async_on_unload(
+        bluetooth.async_register_callback(
+            hass,
+            _async_update_ble,
+            bluetooth.BluetoothCallbackMatcher(address=address.upper(), connectable=True),
+            bluetooth.BluetoothScanningMode.PASSIVE,
+        )
+    )
+
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = Hub(None, address=address, ble=ble)
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
@@ -103,7 +121,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
-        hass.data[DOMAIN].pop(entry.entry_id)
+        hub = hass.data[DOMAIN].pop(entry.entry_id)
+        if hub.ble is not None:
+            await hub.ble.async_stop()
 
     return unload_ok
 
