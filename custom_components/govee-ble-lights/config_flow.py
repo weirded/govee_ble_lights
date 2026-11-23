@@ -16,10 +16,12 @@ from homeassistant.data_entry_flow import FlowResult
 from .const import DOMAIN, CONF_TYPE_API, CONF_TYPE_BLE
 from pathlib import Path
 
+# Read once at import time (imports run in an executor, not the event loop).
+_AVAILABLE_MODELS = sorted(f.name.replace(".json", "") for f in (Path(__file__).parent / "jsons").iterdir())
+
 class GoveeConfigFlow(ConfigFlow, domain=DOMAIN):
     VERSION = 1
-    CONNECTION_CLASS = config_entries.CONN_CLASS_CLOUD_POLL
-
+    
     def __init__(self) -> None:
         """Initialize the config flow."""
         self._api_key: str = ''
@@ -33,11 +35,7 @@ class GoveeConfigFlow(ConfigFlow, domain=DOMAIN):
             CONF_TYPE_BLE: 'BLE',
         }
 
-        jsons_path = Path(Path(__file__).parent / "jsons")
-        for file in jsons_path.iterdir():
-            self._available_models.append(file.name.replace(".json", ""))
-
-        self._available_models.sort()
+        self._available_models = list(_AVAILABLE_MODELS)
 
     async def async_step_bluetooth(
             self, discovery_info: BluetoothServiceInfoBleak

@@ -50,7 +50,8 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
                 _LOGGER.info("Adding device: %s", device)
                 async_add_entities([GoveeAPILight(hub, device)])
     elif hub.address is not None:
-        async_add_entities([GoveeBluetoothLight(hub, hub.ble, config_entry)], update_before_add=False)
+        scenes = await hass.async_add_executor_job(_load_scenes, hub.ble.model)
+        async_add_entities([GoveeBluetoothLight(hub, hub.ble, config_entry, scenes)], update_before_add=False)
         platform = entity_platform.async_get_current_platform()
         platform.async_register_entity_service(
             "set_segments",
@@ -228,12 +229,12 @@ class GoveeBluetoothLight(LightEntity):
     _attr_should_poll = True
     _attr_supported_features = LightEntityFeature.EFFECT
 
-    def __init__(self, hub: Hub, device: GoveeBLEDevice, config_entry: ConfigEntry) -> None:
+    def __init__(self, hub: Hub, device: GoveeBLEDevice, config_entry: ConfigEntry, scenes) -> None:
         self.hub = hub
         self._device = device
         self._mac = hub.address
         self._attr_unique_id = self._mac.replace(":", "")
-        self._scenes = _load_scenes(device.model)
+        self._scenes = scenes
         self._scene_by_code = {code: name for name, (code, _) in self._scenes.items()}
         self._attr_effect_list = list(self._scenes)
         if device.segmented:
