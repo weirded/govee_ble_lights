@@ -260,6 +260,49 @@ class GoveeBLEDevice:
                 self.state.segments[seg].brightness = pct
         self._notify_listeners()
 
+    async def async_set_music(self, mode: int, sensitivity: int = p.DEFAULT_MUSIC_SENSITIVITY,
+                              rgb: tuple[int, int, int] | None = None) -> None:
+        frame = p.music(mode, sensitivity, rgb)
+        await self._write([frame])
+        self.state.mode, self.state.mode_data = p.MODE_MUSIC, bytes(frame[3:9])
+        self._notify_listeners()
+
+    async def async_send_raw(self, frames: list[bytes]) -> dict:
+        """Debug: write frames (checksummed if 19 bytes or shorter), return acks + AA 05."""
+        results = []
+        async with self._lock:
+            try:
+                client = await self._ensure_connected()
+                loop = asyncio.get_running_loop()
+                for frame in frames:
+                    if len(frame) < p.FRAME_LEN:
+                        frame = p.build_frame(frame)
+                    ack = None
+                    if frame[0] == p.HEAD_COMMAND:
+                        fut = loop.create_future()
+                        self._pending_acks[frame[1]] = fut
+                    await client.write_gatt_char(WRITE_UUID, frame, response=False)
+                    if frame[0] == p.HEAD_COMMAND:
+                        try:
+                            ack = "accepted" if await asyncio.wait_for(fut, REPLY_TIMEOUT) else "rejected"
+                        except (TimeoutError, asyncio.CancelledError):
+                            self._pending_acks.pop(frame[1], None)
+                            ack = "no ack"
+                    else:
+                        await asyncio.sleep(INTER_FRAME_DELAY)
+                    results.append({"frame": frame.hex(), "ack": ack})
+            finally:
+                self._schedule_disconnect()
+        await asyncio.sleep(0.5)
+        await self.async_update()
+        return {
+            "writes": results,
+            "mode": self.state.mode,
+            "mode_data": self.state.mode_data.hex(),
+            "power": self.state.power,
+            "brightness_raw": self.state.brightness_raw,
+        }
+
     async def async_set_scene(self, code: int, param: bytes) -> None:
         frames = p.multi_packet(p.HEAD_MULTI, [0x02], param) if param else []
         frames.append(p.scene_activate(code))

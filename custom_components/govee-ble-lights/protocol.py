@@ -42,6 +42,7 @@ CMD_SEGMENTS = 0xA5
 MODE_MANUAL = 0x02
 MODE_SCENE = 0x04
 MODE_MANUAL_ALT = 0x0D
+MODE_MUSIC = 0x0F
 MODE_SEGMENTED = 0x15
 
 # Ops inside MODE_SEGMENTED (byte 3)
@@ -50,18 +51,30 @@ SEG_OP_BRIGHTNESS = 0x02
 
 SEGMENTS_PER_STATUS_FRAME = 3
 
+# Microphone music modes. H6072 (fw 1.03.05) takes ``33 05 0F <mode>
+# <sensitivity 0-100> <autoColor> R G B`` and reads it back verbatim in
+# ``AA 05 0F``; every other 0x05 music sub-mode (01/0C/11/13) is rejected.
+# Names/indices are Govee's own musicMode enum for the SKU.
+MUSIC_MODES = {
+    "H6072": ("Energic", "Dynamic", "Calm", "Bounce", "Hopping", "Strike", "Vibrate",
+              "Skittles", "Torch", "CandyCrush", "Fusion", "Luminous", "Separation"),
+}
+DEFAULT_MUSIC_SENSITIVITY = 80
+
 # Models that take the 0x15 segmented colour encoding.
-SEGMENTED_MODELS = frozenset({"H6053", "H6072", "H6102", "H6199"})
+SEGMENTED_MODELS = frozenset({"H6053", "H6072", "H6102", "H6199", "H7061"})
 
 # Models whose brightness byte is 0-100 rather than 0-255 (verified via AA 04).
-PERCENT_BRIGHTNESS_MODELS = frozenset({"H6072", "H7013"})
+PERCENT_BRIGHTNESS_MODELS = frozenset({"H6072", "H7013", "H7061"})
 
 # Colour sub-mode for non-segmented models. H7013 (fw 1.00.23) acks 33 05 02
 # but drops the RGB; 33 05 0D stores it and reads back as aa 05 0d RR GG BB.
 MANUAL_COLOR_MODES = {"H7013": MODE_MANUAL_ALT}
 
 # Segment counts for models where it is known; used for the all-segments mask.
-SEGMENT_COUNTS = {"H6072": 8}
+# H7061 (fw 1.00.05): two flood heads; only mask bits 0-1 have any effect and
+# AA A5 01 returns two [bri,R,G,B] entries (the cloud claims 15 segments).
+SEGMENT_COUNTS = {"H6072": 8, "H7061": 2}
 
 MIN_KELVIN = 2000
 MAX_KELVIN = 9000
@@ -165,6 +178,15 @@ def segment_brightness(pct: int, mask: int) -> bytes:
     ])
 
 
+def music(mode: int, sensitivity: int = DEFAULT_MUSIC_SENSITIVITY,
+          rgb: tuple[int, int, int] | None = None) -> bytes:
+    """Music mode; ``rgb`` None = automatic colours."""
+    auto = rgb is None
+    r, g, b = rgb or (0, 0, 0)
+    return build_frame([HEAD_COMMAND, CMD_MODE, MODE_MUSIC, mode & 0xFF,
+                        max(0, min(100, int(sensitivity))), 0x01 if auto else 0x00, r, g, b])
+
+
 def scene_activate(code: int) -> bytes:
     return build_frame([HEAD_COMMAND, CMD_MODE, MODE_SCENE, code & 0xFF, (code >> 8) & 0xFF])
 
@@ -224,9 +246,17 @@ class LightState:
     @property
     def kelvin(self) -> int | None:
         """Colour temperature when the light is in white (CT) mode."""
-        if self.mode == MODE_SEGMENTED and len(self.mode_data) >= 3:
+        # H6072 reports CT as aa 05 15 00 <K_hi> <K_lo>; a non-zero first byte
+        # is segment data (H7061 inlines [bri,R,G,B] per head here).
+        if self.mode == MODE_SEGMENTED and len(self.mode_data) >= 3 and self.mode_data[0] == 0:
             k = (self.mode_data[1] << 8) | self.mode_data[2]
             return k or None
+        return None
+
+    @property
+    def music_mode(self) -> int | None:
+        if self.mode == MODE_MUSIC and self.mode_data:
+            return self.mode_data[0]
         return None
 
     @property

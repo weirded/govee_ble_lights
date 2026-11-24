@@ -7,7 +7,7 @@ from homeassistant.components import bluetooth
 from homeassistant.components.light import (ATTR_BRIGHTNESS, ATTR_RGB_COLOR, ATTR_EFFECT, ColorMode, LightEntity,
                                             LightEntityFeature, ATTR_COLOR_TEMP_KELVIN)
 
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, SupportsResponse
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.storage import Store
 import homeassistant.util.color as color_util
@@ -63,6 +63,21 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
                 vol.Optional("brightness_pct"): vol.All(vol.Coerce(int), vol.Range(min=0, max=100)),
             },
             "async_set_segments",
+        )
+        platform.async_register_entity_service(
+            "set_music",
+            {
+                vol.Required("mode"): cv.string,
+                vol.Optional("sensitivity", default=80): vol.All(vol.Coerce(int), vol.Range(min=0, max=100)),
+                vol.Optional("rgb_color"): vol.All(vol.ExactSequence((cv.byte, cv.byte, cv.byte)), vol.Coerce(tuple)),
+            },
+            "async_set_music",
+        )
+        platform.async_register_entity_service(
+            "send_raw",
+            {vol.Required("frames"): vol.All(cv.ensure_list, [cv.string])},
+            "async_send_raw",
+            supports_response=SupportsResponse.ONLY,
         )
 
 
@@ -235,7 +250,9 @@ class GoveeBluetoothLight(LightEntity):
         self._attr_unique_id = self._mac.replace(":", "")
         self._scenes = scenes
         self._scene_by_code = {code: name for name, (code, _) in self._scenes.items()}
-        self._attr_effect_list = list(self._scenes)
+        self._music = {f"Music - {name}": idx for idx, name in enumerate(p.MUSIC_MODES.get(device.model, ()))}
+        self._music_by_idx = {idx: name for name, idx in self._music.items()}
+        self._attr_effect_list = list(self._scenes) + list(self._music)
         if device.segmented:
             self._attr_supported_color_modes = {ColorMode.RGB, ColorMode.COLOR_TEMP}
             self._attr_min_color_temp_kelvin, self._attr_max_color_temp_kelvin = p.ct_range(device.model)
@@ -290,6 +307,9 @@ class GoveeBluetoothLight(LightEntity):
 
     @property
     def effect(self) -> str | None:
+        music = self._device.state.music_mode
+        if music is not None:
+            return self._music_by_idx.get(music)
         code = self._device.state.scene_code
         return self._scene_by_code.get(code) if code is not None else None
 
@@ -300,6 +320,7 @@ class GoveeBluetoothLight(LightEntity):
             "firmware": state.firmware,
             "mode": f"0x{state.mode:02x}" if state.mode is not None else None,
             "scene_code": state.scene_code,
+            "music_sensitivity": state.mode_data[1] if state.music_mode is not None and len(state.mode_data) > 1 else None,
             "color_temp_kelvin": state.kelvin,
             "segments": {
                 seg: {"brightness": s.brightness, "rgb": list(s.rgb)}
@@ -318,9 +339,12 @@ class GoveeBluetoothLight(LightEntity):
             await self._device.async_set_power(True)
         if ATTR_EFFECT in kwargs:
             name = kwargs[ATTR_EFFECT]
-            if name not in self._scenes:
-                raise ValueError(f"unknown scene: {name}")
-            await self._device.async_set_scene(*self._scenes[name])
+            if name in self._music:
+                await self._device.async_set_music(self._music[name])
+            elif name in self._scenes:
+                await self._device.async_set_scene(*self._scenes[name])
+            else:
+                raise ValueError(f"unknown effect: {name}")
         if ATTR_RGB_COLOR in kwargs:
             await self._device.async_set_rgb(tuple(kwargs[ATTR_RGB_COLOR]))
         if ATTR_COLOR_TEMP_KELVIN in kwargs:
@@ -343,3 +367,16 @@ class GoveeBluetoothLight(LightEntity):
             await self._device.async_set_color_temp(color_temp_kelvin, white, segments)
         if brightness_pct is not None:
             await self._device.async_set_segment_brightness(brightness_pct, segments)
+
+    async def async_send_raw(self, frames):
+        """Debug/reverse-engineering: send raw hex frames, return acks and mode readback."""
+        return await self._device.async_send_raw([bytes.fromhex(f.replace(" ", "")) for f in frames])
+
+    async def async_set_music(self, mode, sensitivity=80, rgb_color=None):
+        names = {n.lower(): i for i, n in enumerate(p.MUSIC_MODES.get(self._device.model, ()))}
+        idx = names.get(mode.lower().removeprefix("music - "))
+        if idx is None:
+            raise HomeAssistantError(f"{self._device.model} has no music mode {mode!r}")
+        if not self._device.state.power:
+            await self._device.async_set_power(True)
+        await self._device.async_set_music(idx, sensitivity, rgb_color)

@@ -32,3 +32,41 @@ set_segments:
           min: 0
           max: 100
           unit_of_measurement: "%"
+send_raw:
+  name: Send raw frames (debug)
+  description: Write raw Govee BLE frames (hex; ≤19 bytes get padding + XOR checksum) and return the acks and the light's mode readback.
+  target:
+    entity:
+      integration: govee-ble-lights
+      domain: light
+  fields:
+    frames:
+      name: Frames
+      required: true
+      example: ["330501000063"]
+      selector:
+        object:
+set_music:
+  name: Set music mode
+  description: Microphone music mode with sensitivity and optional fixed colour (models with a mic, e.g. H6072).
+  target:
+    entity:
+      integration: govee-ble-lights
+      domain: light
+  fields:
+    mode:
+      name: Mode
+      required: true
+      example: Energic
+      selector:
+        select:
+          options: [Energic, Dynamic, Calm, Bounce, Hopping, Strike, Vibrate, Skittles, Torch, CandyCrush, Fusion, Luminous, Separation]
+    sensitivity:
+      name: Sensitivity
+      default: 80
+      selector:
+        number: {min: 0, max: 100, unit_of_measurement: "%"}
+    rgb_color:
+      name: Fixed colour (omit for automatic colours)
+      selector:
+        color_rgb:

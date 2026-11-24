@@ -60,3 +60,17 @@ assert p.ct_tint("H6072", 2200) == (0xff, 0x98, 0x29) and p.ct_tint("H6072", 650
 assert p.ct_tint("H6072", 2749) == p.ct_tint("H6072", 2700) and p.ct_tint("H6072", 1500) == p.ct_tint("H6072", 2200)
 assert p.ct_tint("H7013", 3000) is None
 print("ok; CT tints")
+# H6072 music mode (verified 2026-11-23: 33 05 0F accepted, read back verbatim)
+assert p.music(3, 99).hex()[:18] == "33050f036301000000"
+assert p.music(0, 99, (0, 0, 255)).hex()[:18] == "33050f00630000" + "00ff"[:4]
+sm = p.LightState(); p.apply_status_frame(sm, p.build_frame(bytes.fromhex("aa050f0063010000ff")))
+assert sm.music_mode == 0 and sm.scene_code is None
+print("ok; music")
+# H7061 (fw 1.00.05) captured 2026-11-23
+s4 = p.LightState()
+for c in ["aa0100", "aa0428", "aa051564ff00006400ff00", "aaa50164ff00006400ff00"]:
+    p.apply_status_frame(s4, p.build_frame(bytes.fromhex(c)))
+p.trim_segments(s4, "H7061")
+assert s4.kelvin is None and len(s4.segments) == 2 and s4.segments[1].rgb == (255, 0, 0) and s4.segments[2].rgb == (0, 255, 0)
+assert p.all_segments_mask("H7061") == 3 and len(p.status_queries("H7061")) == 4
+print("ok; H7061")
